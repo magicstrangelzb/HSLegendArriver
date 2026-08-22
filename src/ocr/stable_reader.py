@@ -11,12 +11,29 @@ class OcrRejectedError(RuntimeError):
 
 class StableRecommendationReader:
     def __init__(self, config, backend, sleep=time.sleep,
-                 text_normalizer=None, required_headers=()):
+                 text_normalizer=None, required_headers=(), cache=None):
         self.config = config
         self.backend = backend
         self.sleep = sleep
         self.text_normalizer = text_normalizer or self._normalize
         self.required_headers = tuple(required_headers)
+        # Panel-pixel -> OCR evidence cache. Identical pixels always produce
+        # identical OCR output, so a frame whose exact hash was already
+        # recognized can skip the (expensive) inference entirely.
+        self._cache = {} if cache is None else cache
+
+    def _cached(self, frame):
+        """Reuse the OCR result for an unchanged panel, or None on miss."""
+        frame_hash = getattr(frame, "exact_hash", None)
+        if not frame_hash:
+            return None
+        evidence = self._cache.get(frame_hash)
+        if evidence is None:
+            return None
+        return type(evidence)(
+            frame.frame_id, time.time(), evidence.lines,
+            evidence.normalized_text, evidence.confidence,
+            evidence.backend, evidence.preprocessing)
 
     def read(self, frame_supplier, roi_supplier):
         previous_text = None
@@ -25,7 +42,12 @@ class StableRecommendationReader:
         for attempt in range(self.config.max_attempts):
             frame = frame_supplier()
             roi = roi_supplier(frame)
-            evidence = self._recognize_roi(roi, frame.frame_id)
+            evidence = self._cached(frame)
+            if evidence is None:
+                evidence = self._recognize_roi(roi, frame.frame_id)
+                frame_hash = getattr(frame, "exact_hash", None)
+                if evidence is not None and frame_hash:
+                    self._cache[frame_hash] = evidence
             if evidence is None:
                 previous_text = None
                 stable_count = 0
@@ -47,7 +69,12 @@ class StableRecommendationReader:
         raise OcrRejectedError("recommendation_not_stable")
 
     def read_frame(self, frame, roi_supplier):
-        evidence = self._recognize_roi(roi_supplier(frame), frame.frame_id)
+        evidence = self._cached(frame)
+        if evidence is None:
+            evidence = self._recognize_roi(roi_supplier(frame), frame.frame_id)
+            frame_hash = getattr(frame, "exact_hash", None)
+            if evidence is not None and frame_hash:
+                self._cache[frame_hash] = evidence
         if evidence is None:
             raise OcrRejectedError("recommendation_not_confident")
         return evidence

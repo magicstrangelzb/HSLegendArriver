@@ -87,6 +87,15 @@ class DesktopCapture:
         self.process_checker = process_checker
         self.window_reader = window_reader
         self.clock = clock
+        # 换牌结束后（对战期）的小截图模式：只抓策略推荐区。
+        # 换牌期保持 None（全图读取，不碰换牌逻辑）。
+        self.strategy_roi = None
+
+    def set_strategy_roi(self, roi: Optional[tuple[int, int, int, int]]) -> None:
+        self.strategy_roi = roi
+
+    def clear_strategy_roi(self) -> None:
+        self.strategy_roi = None
 
     @property
     def _roi_size(self) -> tuple[int, int]:
@@ -104,7 +113,7 @@ class DesktopCapture:
             raise CaptureEnvironmentError("frame_decode_failed")
         return self.from_array(pixels, validate_environment=False)
 
-    def capture(self) -> FrameEvidence:
+    def capture(self, ocr_panel_ok: bool = False) -> FrameEvidence:
         if not self.process_checker():
             raise CaptureEnvironmentError("required_process_missing")
         hwnd, foreground = self.window_reader()
@@ -112,10 +121,48 @@ class DesktopCapture:
             raise CaptureEnvironmentError("hearthstone_window_missing")
         if not foreground:
             raise CaptureEnvironmentError("hearthstone_not_foreground")
+        if self.strategy_roi is not None:
+            return self._capture_strategy_region(hwnd, foreground)
         pixels = self.screen_grabber()
-        return self.from_array(
-            pixels, validate_environment=True, dpi=self.dpi_reader(),
-            window_handle=hwnd, foreground=foreground)
+        try:
+            return self.from_array(
+                pixels, validate_environment=True, dpi=self.dpi_reader(),
+                window_handle=hwnd, foreground=foreground)
+        except CaptureEnvironmentError as exc:
+            if "recommendation_panel_missing" not in str(exc):
+                raise
+            if not ocr_panel_ok:
+                raise
+            # 换牌面板的红头判定并不可靠；交由 OCR 证据裁定：
+            # 识别出"打法参考A"（stable_reader.required_headers）即确认
+            # 面板在，否则由 reader 置零置信度拒绝，安全兜底。
+            return self.from_array(
+                pixels, validate_environment=False, dpi=self.dpi_reader(),
+                window_handle=hwnd, foreground=foreground)
+
+    def _capture_strategy_region(
+            self, hwnd: int, foreground: bool) -> FrameEvidence:
+        try:
+            rgb = np.asarray(ImageGrab.grab(
+                bbox=self.strategy_roi, all_screens=False))
+        except Exception:
+            self.strategy_roi = None
+            raise CaptureEnvironmentError("recommendation_panel_missing")
+        pixels = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        roi = pixels[:, :, :3]
+        if roi.size == 0 or float(np.std(roi)) < 8.0:
+            # 子区域无可信内容（面板可能换了布局/消失）→ 回退全图
+            self.strategy_roi = None
+            raise CaptureEnvironmentError("recommendation_panel_missing")
+        return FrameEvidence(
+            frame_id=f"frame-{uuid.uuid4()}", captured_at=self.clock(),
+            desktop_size=self.config.desktop_size,
+            dpi=self.config.desktop_dpi,
+            window_handle=hwnd, foreground=foreground,
+            recommendation_roi=self.strategy_roi,
+            exact_hash=hashlib.sha256(roi.tobytes()).hexdigest(),
+            perceptual_hash=self._perceptual_hash(roi),
+            panel_visible=True, pixels=roi)
 
     def from_array(
         self,
@@ -164,6 +211,9 @@ class DesktopCapture:
     def crop_recommendation(self, frame: FrameEvidence) -> np.ndarray:
         height, width = frame.pixels.shape[:2]
         if self._is_roi_frame(width, height):
+            return frame.pixels[:, :, :3].copy()
+        if (self.strategy_roi is not None
+                and frame.recommendation_roi == self.strategy_roi):
             return frame.pixels[:, :, :3].copy()
         return self._crop_array(frame.pixels).copy()
 

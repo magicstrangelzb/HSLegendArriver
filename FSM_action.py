@@ -93,13 +93,17 @@ def initialize_recommendation_automation():
         recommendation_reader = StableRecommendationReader(
             recommendation_config, PaddleOcrAdapter(),
             text_normalizer=recommendation_parser.normalize_action_text,
+            # 固定策略区 (0,230)-(261,630) 内含"打法参考A"标题，
+            # 仍用作面板信标（配合 parser 指令句式双重把关）。
             required_headers=("打法参考A", "打法参考Ａ"))
         recommendation_validator = RecommendationValidator(
             recommendation_config)
 
     def read_mulligan_action():
+        # 换牌面板是否在，由 OCR 证据裁定："打法参考A"标题被识别到
+        # 即承认面板存在（required_headers 过滤 + 换牌句式校验兜底）。
         evidence = recommendation_reader.read(
-            recommendation_capture.capture,
+            lambda: recommendation_capture.capture(ocr_panel_ok=True),
             recommendation_capture.crop_recommendation)
         action = recommendation_parser.parse(
             evidence, log_state.game_num_turns_in_play, log_state.revision)
@@ -120,6 +124,7 @@ def initialize_recommendation_automation():
         validator=recommendation_validator,
         controller=manual_controller,
         result_timeout=recommendation_config.result_timeout_seconds,
+        post_action_delay=recommendation_config.post_action_delay_seconds,
         stopped=shutdown_event.is_set,
     )
 
@@ -407,6 +412,8 @@ def ChoosingCardAction():
             return FSM_BATTLING
 
     if auto_mulligan_flow is not None:
+        # 重试机制同原始代码：识别失败/执行失败 → 打印诊断 → 返回
+        # FSM_CHOOSING_CARD，由外层对战主循环立即重试（~0.2s 一次）。
         result = auto_mulligan_flow.run()
         if result.status == MulliganStatus.CONFIRMED:
             return wait_until_battle_starts()
@@ -492,6 +499,20 @@ def run_automatic_battle_step():
     if not snapshot.is_my_turn:
         _report_automation_diagnostic("opponent_turn", "等待对手操作。")
         return None
+    _report_automation_diagnostic("my_turn", "轮到己方操作：开始读取推荐……")
+    turn = snapshot.game_num_turns_in_play
+    if player_turn_delay_key != turn:
+        # 每个新回合开始只延时一次（给盒子更新推荐留时间），
+        # 同回合内的多次出牌操作之间不重复延时。
+        player_turn_delay_key = turn
+        # 换牌结束后（第一个自己回合）切换小截图模式；换牌期不启用。
+        if recommendation_capture.strategy_roi is None:
+            recommendation_capture.set_strategy_roi(
+                recommendation_config.strategy_roi)
+        manual_controller.output(
+            f"回合 {turn} 开始：延时 "
+            f"{recommendation_config.pre_action_delay_seconds:.0f}s 后开始 OCR……")
+        time.sleep(recommendation_config.pre_action_delay_seconds)
     if recommendation_flow is None:
         return run_manual_battle_step()
 

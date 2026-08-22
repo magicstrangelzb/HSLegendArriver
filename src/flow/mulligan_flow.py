@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
+import time
 
 
 class MulliganStatus(str, Enum):
@@ -18,11 +19,14 @@ class MulliganResult:
 
 class MulliganFlow:
     def __init__(self, executor, action_supplier, state_supplier,
-                 action_context=None, stopped=lambda: False):
+                 action_context=None, stopped=lambda: False,
+                 sleep=time.sleep, pre_action_delay=5.0):
         self.executor = executor
         self.action_supplier = action_supplier
         self.state_supplier = state_supplier
         self.stopped = stopped
+        self.sleep = sleep
+        self.pre_action_delay = pre_action_delay
         if action_context is None:
             from contextlib import nullcontext
             action_context = nullcontext
@@ -61,6 +65,8 @@ class MulliganFlow:
                     for index in selected):
                 return MulliganResult(MulliganStatus.CONCEDE,
                                       diagnostics="mulligan_slot_invalid")
+            print(f"已识别换牌建议，等待 {self.pre_action_delay:.0f}s 后执行……")
+            self.sleep(self.pre_action_delay)
             with self.action_context():
                 for index in selected:
                     self.executor.replace_starting_card(index, count)
